@@ -1,0 +1,24 @@
+manifestVersion: 1
+
+name: "@sntxrr/traefik"
+version: "2026.10.25.1"
+description: "Keep Traefik reverse proxies, the images beside them (CrowdSec and others) and every plugin they load current, through pull requests to the repository each proxy is deployed from -- never by touching a running proxy. `inspect` reads the live proxy over SSH or its API: running version, router and middleware status, and whether plugins failed to load since this start. `check` compares the repository's pins with what is running and with upstream releases, and reports what is behind plus how the deployment is exposed: plugins downloaded from the catalog at every start (a failed download disables every plugin, and with them every router that uses one), pins that never deployed, an insecure API published on a host port, routers that are down. `bump`, dry-run by default, opens one pull request per component: an image tag, a remote plugin's version, or a re-vendored local plugin with its commit and tarball checksum recorded. It defers to an open Dependabot PR that already reaches the target, names one that falls short as superseded, refuses major upgrades unless asked, and refuses deployments that still download plugins at startup unless asked. Plugin middleware configuration, which can carry a CrowdSec LAPI key, is never read into a resource, and neither is a plugin middleware's error text or a partial API response; the container's environment is never read. Unknown is never current: health is null while routers or the plugin-failure log could not be read, and an uncomparable version is a finding."
+repository: "https://github.com/sntxrr/swamp-traefik"
+license: MIT
+
+models:
+  - traefik.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+
+labels:
+  - traefik
+  - reverse-proxy
+  - crowdsec
+  - plugins
+  - drift
+  - version
+  - homelab
+  - self-hosted

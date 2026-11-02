@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/traefik",
+  "version": "2026.10.25.1",
+  "reviewedAt": "2026-10-25T17:27:05Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "githubToken and upstreamToken are .meta({sensitive:true}) and accept vault/env references. The deployment token is sent only to githubApiUrl (https enforced), never to upstream projects, registries or the tarball host; upstream reads go to api.github.com with the optional scope-less upstreamToken or anonymously. Plugin middleware configuration (which can hold a CrowdSec LAPI key), middleware error text, partial API responses and the container environment are never read into a resource. apiUrl with embedded credentials is refused."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs on entry and completion with structured placeholders; a repository that could not be read is a warning. No token or configuration value is logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Errors name the operation, path and HTTP status with a bounded body; an exhausted rate limit is reported as UNKNOWN, not current. bump deliberately records its per-component results (refused/failed/opened) and throws afterwards when any component failed, so PRs it did open are never lost from the record; every other method throws before writing."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "88 Deno tests over the pure functions, the GitHub client with stubbed fetch (token routing, pagination caps, tag merge), tar extraction (pax refusal), log-record matching including forged access-log lines, static-source location through compose mounts, bump's unknown-source refusal and the PR body. Method execution is verified by live inspect/check/bump dry-runs against four real deployments, with every written record strict-validated against its schema."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "bump is dry-run by default, defers to an open PR that already reaches the target, refuses when its branch already exists (left by a closed PR or an interrupted run) instead of overwriting it, and builds every PR on the commit the plan was read from. Each component is independent; one failing does not stop the rest."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "GitHub, registry and Traefik API responses are shape-checked (asRecord/Array.isArray/JSON.parse) before use. Pagination is explicit and every cap is honest: a full router/middleware page leaves health unchecked (listsTruncated), more than 1000 open PRs or 300 tags is an error. A non-JSON 200 from apiUrl falls back to the in-container read. No Retry-After backoff: a rate-limited read fails loudly instead."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Response bodies are cancelled on error paths; every fetch and the ssh subprocess carry a timeout signal tied to the method's abort signal. No temporary files are written; tarballs are processed in memory."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "README, manifest, comments and fixtures use example.net / example.org / api.example placeholders and RFC 5737 addresses. The tree, every commit message and every added line were scanned against the author's private denylist (0 hits) and a list of internal host, domain and repo names. PR bodies no longer name the SSH host."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "All schemas are plain z.object without passthrough; written records were strict-validated."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "runtime, check and bump each declare lifetime infinite with garbageCollection 20/30/30 versions."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Not a CRUD lifecycle model: it inspects a deployment and proposes changes as pull requests."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "bump is the only method with an outward effect and is dry-run by default. Its guards (remote plugins or unknown static source, majors, existing branch, toVersion not upstream, image tag not in the registry) are in-method refusals rather than skippable labelled checks on purpose: a skip label must not bypass the plugin-download outage guard, and a check cannot record the refusal in the bump resource."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "One resource per method, each with a fixed instance name equal to its spec (runtime, check, bump); no two methods write the same spec."
+    },
+    {
+      "id": "data-access",
+      "verdict": "na",
+      "note": "No method reads back stored state; each recomputes from the live proxy and the repository."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "na",
+      "note": "First published version; no earlier schema to migrate."
+    }
+  ]
+}

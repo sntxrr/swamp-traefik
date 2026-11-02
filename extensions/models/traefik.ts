@@ -1263,6 +1263,13 @@ export class GitHub {
           }
         }
         if (items.length < 100) break;
+        if (kind === "tags" && page === 3) {
+          // Tags carry no date order; with more than 300, the newest may be
+          // unread, and "current" would be a guess.
+          throw new Error(
+            `${repo} has more than 300 tags; its newest version cannot be determined`,
+          );
+        }
         // Releases come newest first: once a page reaches the pinned version,
         // everything newer has been seen, and further pages only spend the
         // anonymous rate limit (60 requests/hour per IP). Tags carry no such
@@ -1351,9 +1358,11 @@ export class GitHub {
           author: String(asRecord(p.user).login),
         });
       }
-      if (items.length < 100) break;
+      if (items.length < 100) return out;
     }
-    return out;
+    throw new Error(
+      `${repo} has more than 1000 open pull requests; an existing bump PR could be missed, so refusing to decide`,
+    );
   }
 }
 
@@ -1550,6 +1559,9 @@ export const RECORD_START =
   '^(\\{"(level|error)"|[0-9]{4}-[0-9]{2}-[0-9]{2}T|time=")';
 
 /** API paths read from inside the container, in order. */
+/** Page size requested from the Traefik API; a full page means "maybe more". */
+export const API_PAGE_SIZE = 1000;
+
 export const API_PATHS = [
   "version",
   "overview",
@@ -1812,6 +1824,8 @@ export interface Runtime {
     error: string | null;
   };
   routersChecked: boolean;
+  /** A router or middleware list filled its page, so some were not read. */
+  listsTruncated: boolean;
   routers: {
     total: number;
     enabled: number;
@@ -1837,7 +1851,7 @@ export interface Runtime {
    */
   healthy: boolean | null;
   /** Set by inspect when the repository (log file location) was unreadable. */
-  repoReadError?: string;
+  repoReadError: string | null;
   timestamp: string;
 }
 
@@ -1924,7 +1938,14 @@ export function buildRuntime(input: {
     notEnabled.length > 0 || (overviewErrors ?? 0) > 0 ||
     mwNotEnabled.some((m) => m.isPlugin);
   const logsBlind = !containerLogsReadable && logFile.readable !== true;
-  const unchecked = !reachable || logsBlind || logFile.readable === false;
+  // A list that filled its page may have more behind it: what was not read
+  // was not checked.
+  const truncated = reachable &&
+    [...routerDocs, middlewaresRaw].some((d) =>
+      Array.isArray(d) && d.length >= API_PAGE_SIZE
+    );
+  const unchecked = !reachable || truncated || logsBlind ||
+    logFile.readable === false;
   return {
     host: input.host,
     container: input.container,
@@ -1941,7 +1962,8 @@ export function buildRuntime(input: {
       via: reachable ? input.apiVia : "none",
       error: reachable ? null : input.apiError,
     },
-    routersChecked: reachable,
+    routersChecked: reachable && !truncated,
+    listsTruncated: truncated,
     routers: {
       total: routers.length,
       enabled: routers.length - notEnabled.length,
@@ -1959,6 +1981,7 @@ export function buildRuntime(input: {
     containerLogsReadable,
     logFile,
     healthy: failed ? false : unchecked ? null : true,
+    repoReadError: null,
     timestamp: new Date().toISOString(),
   };
 }
@@ -2142,6 +2165,7 @@ const RuntimeSchema = z.object({
     error: z.string().nullable(),
   }),
   routersChecked: z.boolean(),
+  listsTruncated: z.boolean(),
   routers: z.object({
     total: z.number(),
     enabled: z.number(),
@@ -2162,7 +2186,7 @@ const RuntimeSchema = z.object({
     readable: z.boolean().nullable(),
   }),
   healthy: z.boolean().nullable(),
-  repoReadError: z.string().optional(),
+  repoReadError: z.string().nullable(),
   timestamp: z.string(),
 });
 
@@ -2256,9 +2280,9 @@ const BumpSchema = z.object({
   timestamp: z.string(),
 });
 
-type Component = z.infer<typeof ComponentSchema>;
+export type Component = z.infer<typeof ComponentSchema>;
 type Finding = z.infer<typeof FindingSchema>;
-type BumpResult = z.infer<typeof BumpSchema>["results"][number];
+export type BumpResult = z.infer<typeof BumpSchema>["results"][number];
 
 interface Context {
   globalArgs: GlobalArgs;
@@ -3337,7 +3361,7 @@ async function planLocalPluginBump(
   return out;
 }
 
-function prBody(
+export function prBody(
   _g: GlobalArgs,
   c: Component,
   from: ParsedVersion,
@@ -3449,7 +3473,7 @@ async function openPr(
 }
 
 /** Plan (and, unless dry-run, open) the PR for one component. */
-async function bumpOne(
+export async function bumpOne(
   g: GlobalArgs,
   gh: GitHub,
   desired: Desired,
@@ -3642,6 +3666,10 @@ export const model = {
       arguments: z.object({}),
       execute: async (_args: Record<never, never>, context: Context) => {
         const g = context.globalArgs;
+        context.logger.info("inspect {container} on {host}", {
+          container: g.container,
+          host: g.sshHost,
+        });
         let desired: Desired | null = null;
         let repoError: string | null = null;
         if (g.repo) {
@@ -3705,6 +3733,11 @@ export const model = {
       execute: async (args: { live: boolean }, context: Context) => {
         const g = context.globalArgs;
         const repo = requireRepo(g);
+        context.logger.info("check {repo}@{ref} (live={live})", {
+          repo,
+          ref: g.ref,
+          live: args.live,
+        });
         const gh = new GitHub(
           g.githubApiUrl,
           g.githubToken,
@@ -3789,6 +3822,11 @@ export const model = {
       ) => {
         const g = context.globalArgs;
         const repo = requireRepo(g);
+        context.logger.info("bump {component} in {repo} (dryRun={dryRun})", {
+          component: args.component,
+          repo,
+          dryRun: args.dryRun,
+        });
         if (!args.dryRun && !g.githubToken) {
           throw new Error("bump with dryRun=false needs githubToken");
         }

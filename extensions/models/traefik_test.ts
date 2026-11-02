@@ -7,6 +7,7 @@ import {
 import {
   allowCatalogTestData,
   buildRuntime,
+  bumpOne,
   chooseTarget,
   compareVersions,
   composeImages,
@@ -33,9 +34,11 @@ import {
   parseVersion,
   type PluginDecl,
   pluginsDisabledRecord,
+  prBody,
   publishesPort,
   recordSection,
   refPath,
+  Refusal,
   registryCoordinates,
   relatedPrs,
   type Release,
@@ -1530,4 +1533,111 @@ Deno.test("R3: flags in `--key value` form are read", () => {
   ]);
   assertEquals(s.plugins.map((p) => `${p.name}@${p.version}`), ["geo@v0.3.1"]);
   assert(s.apiInsecure);
+});
+
+Deno.test("R3 truncation: a full page of routers leaves health unchecked", () => {
+  const routers = Array.from({ length: 1000 }, (_, i) => ({
+    name: `r${i}@docker`,
+    status: "enabled",
+    provider: "docker",
+  }));
+  const r = runtimeWith({
+    api: apiMap({ "http/routers?per_page=1000": JSON.stringify(routers) }),
+  });
+  assert(r.listsTruncated);
+  assertFalse(r.routersChecked);
+  assertEquals(r.healthy, null);
+  assertEquals(runtimeWith().listsTruncated, false);
+  assertEquals(runtimeWith().repoReadError, null);
+});
+
+Deno.test("R3 truncation: more than 1000 open PRs is an error, not a guess", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (() =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify(
+          Array.from({ length: 100 }, (_, i) => ({
+            number: i,
+            html_url: "u",
+            title: "t",
+            head: { ref: "b", repo: { full_name: "me/deploy" } },
+            user: { login: "a" },
+          })),
+        ),
+        { status: 200 },
+      ),
+    )) as typeof fetch;
+  try {
+    let threw = false;
+    try {
+      await new GitHub("https://api.example", "T", 1000).openPulls(
+        "me/deploy",
+        "main",
+      );
+    } catch {
+      threw = true;
+    }
+    assert(threw);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+Deno.test("R3.2: bump refuses when the static configuration source is unknown", async () => {
+  const c = component({ latestUrl: "https://example.org/r" });
+  const base = {
+    component: c.id,
+    from: c.pinned,
+    to: null,
+    status: "refused" as const,
+    reason: null,
+    branch: null,
+    prUrl: null,
+    files: [],
+    notes: [],
+  };
+  const args = { dryRun: true, allowMajor: false, allowRemotePlugins: false };
+  // deno-lint-ignore no-explicit-any
+  const desired = { configSource: "unknown" } as any;
+  let err: unknown = null;
+  try {
+    // deno-lint-ignore no-explicit-any
+    await bumpOne({} as any, {} as any, desired, c, args, [], [], base);
+  } catch (e) {
+    err = e;
+  }
+  assert(err instanceof Refusal);
+  assertStringIncludes((err as Error).message, "unknown");
+});
+
+Deno.test("R3.12/R3.14: PR body flags a 0.x minor and never names the host", () => {
+  const c = component({ kind: "plugin", name: "geo", pinned: "v0.8.9" });
+  const body = prBody(
+    // deno-lint-ignore no-explicit-any
+    { sshHost: "proxy.internal.example" } as any,
+    c,
+    parseVersion("v0.8.9")!,
+    "v0.9.0",
+    parseVersion("v0.9.0")!,
+    null,
+    [],
+    [],
+    [],
+  );
+  assertStringIncludes(body, "Pre-1.0 minor");
+  assertFalse(body.includes("proxy.internal.example"));
+  const patch = prBody(
+    // deno-lint-ignore no-explicit-any
+    {} as any,
+    c,
+    parseVersion("v0.8.9")!,
+    "v0.8.10",
+    parseVersion("v0.8.10")!,
+    null,
+    [],
+    [],
+    [],
+  );
+  assertFalse(patch.includes("Pre-1.0 minor"));
 });

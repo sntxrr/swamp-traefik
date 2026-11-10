@@ -3974,7 +3974,15 @@ export const model = {
   type: "@sntxrr/traefik/instance",
   description:
     "One Traefik deployment: its live state (version, router and middleware health, whether plugins loaded), how far its pinned Traefik, sidecar images and plugins have fallen behind upstream, and pull requests that bump them. `inspect` and `check` are read-only; `bump` writes only a pull request to the deployment's repository, dry-run by default.",
-  version: "2026.10.25.1",
+  version: "2026.11.10.1",
+  upgrades: [
+    {
+      toVersion: "2026.11.10.1",
+      description:
+        "bump gains autoMerge, requiredChecks and mergeMethod (method arguments); global arguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgsSchema,
   resources: {
     runtime: {
@@ -4131,7 +4139,11 @@ export const model = {
     },
     bump: {
       description:
-        "Open one pull request per component that is behind, in the deployment's repository: an image tag, a remote plugin version, or a re-vendored local plugin with its provenance recorded. DRY-RUN BY DEFAULT. Never merges by itself and never touches the host; with autoMerge it arms GitHub auto-merge on patch (or patch and minor) bumps -- its own PRs and a trusted bot's -- and only when the base branch's rulesets require every check named in requiredChecks, so GitHub merges only after those checks (and any other rule on the branch) pass. A major is never armed. Skips components with an open PR already; refuses major upgrades unless allowMajor, target versions that do not exist upstream, and instances that download plugins at startup unless allowRemotePlugins. Each component is independent: one failing is recorded and the rest still run; the method fails at the end if any did.",
+        "Open one pull request per component that is behind, in the deployment's repository: an image tag, a remote plugin version, or a re-vendored local plugin with its provenance recorded. DRY-RUN BY DEFAULT. " +
+        "Never merges by itself and never touches the host; with autoMerge it arms GitHub auto-merge on patch (or patch and minor) bumps -- its own PRs and a trusted bot's -- and only when the base branch's rulesets require every check named in requiredChecks, " +
+        "so GitHub merges only after those checks (and any other rule on the branch) pass. A major is never armed. " +
+        "Skips components with an open PR already; refuses major upgrades unless allowMajor, target versions that do not exist upstream, and instances that download plugins at startup unless allowRemotePlugins. " +
+        "Each component is independent: one failing is recorded and the rest still run; the method fails at the end if any did.",
       arguments: z.object({
         component: z.string().default("all").describe(
           "`all` (every component that is behind), or one id from `check`: `image:traefik`, `image:crowdsecurity/crowdsec`, `plugin:<name>`.",

@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/traefik",
+  "version": "2026.11.10.1",
+  "reviewedAt": "2026-11-10T19:32:12Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Deployment token is sent only to apiUrl (GraphQL path resolves on the same host); upstream reads stay anonymous/upstreamToken. No token in resources or logs."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Gate state logged once per run; each result logs auto-merge state."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "GraphQL errors at HTTP 200 are thrown; arm/blocked failures fail the method after the resource is written; label failure is reported, not swallowed."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "95 tests: scope matrix incl. 0.x minor and prerelease, gate, not-armable human branch, held, label-after-arm, clean-status merge, GHES GraphQL URL, rulesets parsing."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Re-runs: already-armed and held are no-ops; branch-exists refusal prevents retrying a rejected version. Arming is never undone (documented)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "issue",
+      "note": "enablePullRequestAutoMerge, rules/branches and the clean-status merge match GitHub docs, but the label POST (auto-creates the label) and the clean-status fallback are exercised against stubs only; first live proof is the sodden Dependabot PR."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No new long-lived resources; fetch bodies consumed by request()."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Independent review scan: no internal hostnames, IPs, vault or private repo names in code, tests, docs or commits."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "autoMerge enum nullable, set on every result; armed counter always written."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "na",
+      "note": "No data lifecycle change."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "No new CRUD surface; bump remains create-only on PRs."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "autoMerge without requiredChecks throws before any call; ruleset gate checked before arming."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "bump still writes the single `bump` instance with one schema."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "No new data reads."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "Model version 2026.11.10.1 with no-op upgrade; only method arguments changed."
+    }
+  ]
+}

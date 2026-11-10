@@ -1077,7 +1077,20 @@ export interface PullRef {
   title: string;
   head: string;
   author: string;
+  /** GraphQL node id; what enablePullRequestAutoMerge takes. */
+  nodeId?: string;
+  /** Whether auto-merge is already enabled on it. */
+  autoMergeArmed?: boolean;
+  /** GitHub's account type for the author: `Bot` for an App or a dependency bot. */
+  authorType?: string;
+  labels?: string[];
 }
+
+/**
+ * Put on a PR when `bump` arms it. A PR that carries it but is no longer armed
+ * was disarmed by a person, and is never re-armed.
+ */
+export const ARMED_LABEL = "swamp-auto-merge";
 
 /** Where upstream releases and tags are read. */
 const UPSTREAM_API = "https://api.github.com";
@@ -1356,6 +1369,12 @@ export class GitHub {
           title: String(p.title),
           head: String(asRecord(p.head).ref),
           author: String(asRecord(p.user).login),
+          nodeId: asString(p.node_id) ?? undefined,
+          autoMergeArmed: p.auto_merge !== null && p.auto_merge !== undefined,
+          authorType: asString(asRecord(p.user).type) ?? undefined,
+          labels: (Array.isArray(p.labels) ? p.labels : []).map((l) =>
+            asString(asRecord(l).name) ?? ""
+          ).filter(Boolean),
         });
       }
       if (items.length < 100) return out;
@@ -1364,6 +1383,101 @@ export class GitHub {
       `${repo} has more than 1000 open pull requests; an existing bump PR could be missed, so refusing to decide`,
     );
   }
+
+  /**
+   * The status checks the branch's rulesets require before a merge. Rulesets
+   * only: classic branch protection needs Administration read, which a
+   * narrowly scoped App token does not have, so it is not consulted -- and an
+   * auto-merge gate that cannot see a requirement must treat it as absent.
+   */
+  async requiredChecks(repo: string, branch: string): Promise<string[]> {
+    const out = new Set<string>();
+    for (let page = 1; page <= 10; page++) {
+      const r = await this.request(
+        "GET",
+        `/repos/${repo}/rules/branches/${
+          refPath(branch)
+        }?per_page=100&page=${page}`,
+      );
+      const rules = (Array.isArray(r.data) ? r.data : []).map(asRecord);
+      for (const rule of rules) {
+        if (rule.type !== "required_status_checks") continue;
+        const checks = asRecord(rule.parameters).required_status_checks;
+        for (const c of Array.isArray(checks) ? checks : []) {
+          const ctx = asString(asRecord(c).context);
+          if (ctx) out.add(ctx);
+        }
+      }
+      if (rules.length < 100) return [...out].sort();
+    }
+    throw new Error(
+      `${repo}@${branch} has more than 1000 branch rules; a required check could be missed, so refusing to decide`,
+    );
+  }
+
+  /**
+   * Arm GitHub auto-merge on a pull request: it merges once every required
+   * check passes, and never before. GraphQL only; REST has no endpoint.
+   * GraphQL reports failure as HTTP 200 with `errors`, so those are thrown.
+   */
+  async enableAutoMerge(
+    nodeId: string,
+    method: "squash" | "merge" | "rebase",
+  ): Promise<void> {
+    const r = await this.request("POST", graphqlPath(this.apiUrl), {
+      body: {
+        query:
+          "mutation($id: ID!, $m: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $m}) { pullRequest { number } } }",
+        variables: { id: nodeId, m: method.toUpperCase() },
+      },
+    });
+    const errors = asRecord(r.data).errors;
+    if (Array.isArray(errors) && errors.length) {
+      throw new Error(
+        `enablePullRequestAutoMerge: ${
+          errors.map((e) => asString(asRecord(e).message) ?? "?").join("; ")
+        }`.slice(0, 400),
+      );
+    }
+  }
+
+  /**
+   * Merge a PR now, but only when GitHub itself says every requirement is
+   * met (`mergeable_state: clean`), and only at the head it judged: a push in
+   * between makes GitHub refuse the merge. This is what auto-merge would do;
+   * GitHub refuses to arm a PR that is already clean.
+   */
+  async mergeIfClean(
+    repo: string,
+    number: number,
+    method: "squash" | "merge" | "rebase",
+  ): Promise<boolean> {
+    const r = await this.request("GET", `/repos/${repo}/pulls/${number}`);
+    const d = asRecord(r.data);
+    if (d.mergeable_state !== "clean") return false;
+    const sha = asString(asRecord(d.head).sha);
+    if (!sha) return false;
+    await this.request("PUT", `/repos/${repo}/pulls/${number}/merge`, {
+      body: { sha, merge_method: method },
+    });
+    return true;
+  }
+
+  /** Label a PR (issues API; pull_requests: write is enough for a PR). */
+  async addLabel(repo: string, number: number, label: string): Promise<void> {
+    await this.request("POST", `/repos/${repo}/issues/${number}/labels`, {
+      body: { labels: [label] },
+    });
+  }
+}
+
+/**
+ * The GraphQL path for a REST base: `https://api.github.com` serves it at
+ * `/graphql`, GitHub Enterprise (`https://host/api/v3`) at `/api/graphql`.
+ * Returned relative to the REST base, because request() prefixes that.
+ */
+export function graphqlPath(apiUrl: string): string {
+  return /\/api\/v3\/?$/.test(apiUrl) ? "/../graphql" : "/graphql";
 }
 
 /**
@@ -2264,6 +2378,19 @@ const BumpSchema = z.object({
     reason: z.string().nullable(),
     branch: z.string().nullable(),
     prUrl: z.string().nullable(),
+    autoMerge: z.enum([
+      "armed",
+      "already-armed",
+      "merged",
+      "would-arm",
+      "out-of-scope",
+      "not-armable",
+      "held",
+      "blocked",
+      "failed",
+    ]).nullable().describe(
+      "null when autoMerge is off. `merged`: its required checks had already passed, so it was merged at the head GitHub judged. `not-armable`: a person's PR. `held`: a person disarmed it, so it is left alone. `blocked`: the base branch does not require every check in requiredChecks, so nothing was armed. `failed`: the PR is open but arming it failed (the method then fails).",
+    ),
     files: z.array(z.object({
       path: z.string(),
       action: z.enum(["modify", "add", "delete"]),
@@ -2277,6 +2404,7 @@ const BumpSchema = z.object({
   })),
   opened: z.number(),
   failed: z.number(),
+  armed: z.number(),
   timestamp: z.string(),
 });
 
@@ -2633,6 +2761,61 @@ export function chooseTarget(
 
 type PrRow = z.infer<typeof PrSchema>;
 
+/** A PR row plus what auto-merge needs; the extra fields are never stored. */
+export type RelatedPr = PrRow & {
+  to: ParsedVersion;
+  nodeId: string | null;
+  autoMergeArmed: boolean;
+  /**
+   * Whether the PR may be armed: a trusted dependency bot's, or a
+   * `swamp-traefik/` branch opened by a bot account (this model's App). A
+   * person can push a branch with that name; theirs is deferred to, not armed.
+   */
+  armable: boolean;
+  labels: string[];
+};
+
+/** How far an unattended merge may go. `major` is deliberately not a scope. */
+export type AutoMergeScope = "off" | "patch" | "minor";
+
+/** Whether a move of `kind` is inside `scope`. A major is never inside one. */
+export function autoMergeAllows(
+  scope: AutoMergeScope,
+  kind: "major" | "minor" | "patch",
+): boolean {
+  if (scope === "off" || kind === "major") return false;
+  return scope === "minor" || kind === "patch";
+}
+
+/**
+ * The kind of move as auto-merge must see it. Under semver a 0.x minor may
+ * break compatibility, so it counts as a major: the PR still opens, but a
+ * person merges it.
+ */
+export function autoMergeKind(
+  from: ParsedVersion,
+  to: ParsedVersion,
+): "major" | "minor" | "patch" {
+  // A prerelease is never unattended, whatever part of the version moved.
+  if (to.prerelease !== null) return "major";
+  const kind = bumpKind(from, to);
+  return kind === "minor" && from.major === 0 ? "major" : kind;
+}
+
+/** Names in `want` that `have` lacks, i.e. checks an auto-merge would skip. */
+export function missingChecks(want: string[], have: string[]): string[] {
+  const h = new Set(have);
+  return want.filter((w) => !h.has(w));
+}
+
+/** The auto-merge gate for one run: whether arming is safe at all. */
+export interface AutoMergeGate {
+  scope: AutoMergeScope;
+  method: "squash" | "merge" | "rebase";
+  /** null when arming is safe; otherwise why nothing may be armed. */
+  blocked: string | null;
+}
+
 /** Authors whose `Bump x from a to b` titles are trusted. */
 const TRUSTED_BUMP_AUTHORS = /^(?:app\/)?(?:dependabot|renovate)(?:\[bot\])?$/i;
 
@@ -2650,9 +2833,9 @@ export function relatedPrs(
   component: { kind: "image" | "plugin"; name: string },
   target: ParsedVersion | null,
   pinned: ParsedVersion | null = null,
-): { pending: PrRow[]; superseded: PrRow[] } {
-  const pending: PrRow[] = [];
-  const superseded: PrRow[] = [];
+): { pending: RelatedPr[]; superseded: RelatedPr[] } {
+  const pending: RelatedPr[] = [];
+  const superseded: RelatedPr[] = [];
   const repoName = component.name.split("/").pop()!;
   const prefix = `swamp-traefik/${slug(componentId(component))}-`;
   for (const p of pulls) {
@@ -2676,11 +2859,17 @@ export function relatedPrs(
       to = parseVersion(m[3].replace(/[`.,]+$/, ""));
     }
     if (!to) continue;
-    const row = {
+    const row: RelatedPr = {
       number: p.number,
       url: p.url,
       title: p.title,
       author: p.author,
+      to,
+      nodeId: p.nodeId ?? null,
+      autoMergeArmed: p.autoMergeArmed ?? false,
+      armable: TRUSTED_BUMP_AUTHORS.test(p.author) ||
+        (p.head.startsWith(prefix) && p.authorType === "Bot"),
+      labels: p.labels ?? [],
     };
     if (!target || compareVersions(to, target) >= 0) pending.push(row);
     else superseded.push(row);
@@ -3421,7 +3610,7 @@ async function openPr(
   title: string,
   body: string,
   files: FileChange[],
-): Promise<string> {
+): Promise<{ url: string; nodeId: string | null; number: number }> {
   const repo = requireRepo(g);
   const baseObj = await gh.request(
     "GET",
@@ -3469,7 +3658,115 @@ async function openPr(
   const pr = await gh.request("POST", `/repos/${repo}/pulls`, {
     body: { title, head: branch, base: g.ref, body },
   });
-  return String(asRecord(pr.data).html_url);
+  const d = asRecord(pr.data);
+  return {
+    url: String(d.html_url),
+    nodeId: asString(d.node_id),
+    number: Number(d.number),
+  };
+}
+
+/** What arming needs to know about one PR. */
+export interface ArmTarget {
+  number: number;
+  nodeId: string | null;
+  autoMergeArmed: boolean;
+  /** See RelatedPr.armable; true for a PR this run just opened. */
+  armable: boolean;
+  labels: string[];
+}
+
+/**
+ * Arm auto-merge on one bump PR, or say why not. Only a PR this model opened
+ * (its branch, from a bot account) or a trusted dependency bot's is armed;
+ * a person's is not, whatever its branch is called. A PR a person disarmed --
+ * it carries ARMED_LABEL but auto-merge is off -- is left alone. GitHub then
+ * merges once every check the rulesets require has passed.
+ */
+export async function armAutoMerge(
+  gh: Pick<GitHub, "enableAutoMerge" | "mergeIfClean" | "addLabel">,
+  repo: string,
+  gate: AutoMergeGate,
+  kind: "major" | "minor" | "patch",
+  pr: ArmTarget | null,
+  dryRun: boolean,
+): Promise<{ state: BumpResult["autoMerge"]; note: string | null }> {
+  if (gate.scope === "off") return { state: null, note: null };
+  if (pr && !pr.armable) {
+    return {
+      state: "not-armable",
+      note:
+        `auto-merge not armed: PR #${pr.number} is not this model's or a trusted bot's`,
+    };
+  }
+  if (!autoMergeAllows(gate.scope, kind)) {
+    return {
+      state: "out-of-scope",
+      note: kind === "major"
+        ? "auto-merge not armed: a major, 0.x minor or prerelease is never merged unattended; a person merges it"
+        : `auto-merge not armed: a ${kind} bump is outside autoMerge=${gate.scope}; a person merges it`,
+    };
+  }
+  if (gate.blocked) {
+    return { state: "blocked", note: `auto-merge not armed: ${gate.blocked}` };
+  }
+  if (pr?.autoMergeArmed) return { state: "already-armed", note: null };
+  if (pr && pr.labels.includes(ARMED_LABEL)) {
+    return {
+      state: "held",
+      note:
+        `auto-merge not re-armed: PR #${pr.number} carries ${ARMED_LABEL} but is no longer armed, so a person disarmed it`,
+    };
+  }
+  if (dryRun) return { state: "would-arm", note: null };
+  if (!pr?.nodeId) {
+    return {
+      state: "failed",
+      note: "auto-merge not armed: GitHub returned no node id for the PR",
+    };
+  }
+  let state: BumpResult["autoMerge"] = "armed";
+  try {
+    await gh.enableAutoMerge(pr.nodeId, gate.method);
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    // GitHub will not arm a PR whose requirements are already all met.
+    let merged = false;
+    if (/clean status/i.test(m)) {
+      try {
+        merged = await gh.mergeIfClean(repo, pr.number, gate.method);
+      } catch (err2) {
+        const m2 = err2 instanceof Error ? err2.message : String(err2);
+        return {
+          state: "failed",
+          note: `PR #${pr.number} was clean but merging it failed: ${m2}`
+            .slice(0, 500),
+        };
+      }
+    }
+    if (!merged) {
+      return {
+        state: "failed",
+        note: `auto-merge not armed: ${m}`.slice(0, 500),
+      };
+    }
+    state = "merged";
+  }
+  if (state === "merged") return { state, note: null };
+  // After arming, never before: a label on a PR whose arming failed would
+  // read as "a person disarmed it" and stop every later attempt.
+  try {
+    await gh.addLabel(repo, pr.number, ARMED_LABEL);
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    return {
+      state,
+      note:
+        `armed, but labelling it ${ARMED_LABEL} failed, so a later disarm by a person would be undone: ${m}`
+          .slice(0, 500),
+    };
+  }
+  return { state, note: null };
 }
 
 /** Plan (and, unless dry-run, open) the PR for one component. */
@@ -3488,6 +3785,7 @@ export async function bumpOne(
   pulls: PullRef[],
   base: BumpResult,
   signal?: AbortSignal,
+  gate: AutoMergeGate = { scope: "off", method: "squash", blocked: null },
 ): Promise<BumpResult> {
   const pin = c.pinned ? parseTag(c.pinned) : null;
   if (!pin || pin.precision < 3) {
@@ -3546,13 +3844,23 @@ export async function bumpOne(
   }
   const prs = relatedPrs(pulls, c, toV, pin.version);
   if (prs.pending.length) {
+    const pr = prs.pending[0];
+    // The kind is the PR's own move, not ours: a bot PR may go further.
+    const am = await armAutoMerge(
+      gh,
+      requireRepo(g),
+      gate,
+      autoMergeKind(pin.version, pr.to),
+      pr,
+      args.dryRun,
+    );
     return {
       ...base,
       status: "existing-pr",
-      prUrl: prs.pending[0].url,
-      reason: `PR #${prs.pending[0].number} by ${
-        prs.pending[0].author
-      } already moves it`,
+      prUrl: pr.url,
+      reason: `PR #${pr.number} by ${pr.author} already moves it`,
+      autoMerge: am.state,
+      notes: am.note ? [am.note] : [],
     };
   }
   if (c.kind === "image") {
@@ -3600,10 +3908,19 @@ export async function bumpOne(
       `branch ${branch} already exists without an open PR (left by a closed PR or an interrupted run); delete it to retry`,
     );
   }
+  const kind = autoMergeKind(pin.version, toV);
   if (args.dryRun) {
-    return { ...base, status: "would-open", branch, files: report, notes };
+    const am = await armAutoMerge(gh, requireRepo(g), gate, kind, null, true);
+    return {
+      ...base,
+      status: "would-open",
+      branch,
+      files: report,
+      autoMerge: am.state,
+      notes: am.note ? [...notes, am.note] : notes,
+    };
   }
-  const prUrl = await openPr(
+  const opened = await openPr(
     g,
     gh,
     desired.commit,
@@ -3622,7 +3939,29 @@ export async function bumpOne(
     ),
     files,
   );
-  return { ...base, status: "opened", branch, prUrl, files: report, notes };
+  const am = await armAutoMerge(
+    gh,
+    requireRepo(g),
+    gate,
+    kind,
+    {
+      number: opened.number,
+      nodeId: opened.nodeId,
+      autoMergeArmed: false,
+      armable: true,
+      labels: [],
+    },
+    false,
+  );
+  return {
+    ...base,
+    status: "opened",
+    branch,
+    prUrl: opened.url,
+    files: report,
+    autoMerge: am.state,
+    notes: am.note ? [...notes, am.note] : notes,
+  };
 }
 
 // --- definition -----------------------------------------------------------
@@ -3635,7 +3974,15 @@ export const model = {
   type: "@sntxrr/traefik/instance",
   description:
     "One Traefik deployment: its live state (version, router and middleware health, whether plugins loaded), how far its pinned Traefik, sidecar images and plugins have fallen behind upstream, and pull requests that bump them. `inspect` and `check` are read-only; `bump` writes only a pull request to the deployment's repository, dry-run by default.",
-  version: "2026.10.25.1",
+  version: "2026.11.10.1",
+  upgrades: [
+    {
+      toVersion: "2026.11.10.1",
+      description:
+        "bump gains autoMerge, requiredChecks and mergeMethod (method arguments); global arguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgsSchema,
   resources: {
     runtime: {
@@ -3792,7 +4139,11 @@ export const model = {
     },
     bump: {
       description:
-        "Open one pull request per component that is behind, in the deployment's repository: an image tag, a remote plugin version, or a re-vendored local plugin with its provenance recorded. DRY-RUN BY DEFAULT. Never merges and never touches the host. Skips components with an open PR already; refuses major upgrades unless allowMajor, target versions that do not exist upstream, and instances that download plugins at startup unless allowRemotePlugins. Each component is independent: one failing is recorded and the rest still run; the method fails at the end if any did.",
+        "Open one pull request per component that is behind, in the deployment's repository: an image tag, a remote plugin version, or a re-vendored local plugin with its provenance recorded. DRY-RUN BY DEFAULT. " +
+        "Never merges by itself and never touches the host; with autoMerge it arms GitHub auto-merge on patch (or patch and minor) bumps -- its own PRs and a trusted bot's -- and only when the base branch's rulesets require every check named in requiredChecks, " +
+        "so GitHub merges only after those checks (and any other rule on the branch) pass. A major is never armed. " +
+        "Skips components with an open PR already; refuses major upgrades unless allowMajor, target versions that do not exist upstream, and instances that download plugins at startup unless allowRemotePlugins. " +
+        "Each component is independent: one failing is recorded and the rest still run; the method fails at the end if any did.",
       arguments: z.object({
         component: z.string().default("all").describe(
           "`all` (every component that is behind), or one id from `check`: `image:traefik`, `image:crowdsecurity/crowdsec`, `plugin:<name>`.",
@@ -3809,6 +4160,14 @@ export const model = {
         allowRemotePlugins: z.boolean().default(false).describe(
           "Open PRs even though this deployment downloads plugins at startup, so every merge risks a plugin-download outage.",
         ),
+        autoMerge: z.enum(["off", "patch", "minor"]).default("off").describe(
+          "Arm GitHub auto-merge on bump PRs up to this kind (`minor` includes patch). Majors are never armed. Needs requiredChecks.",
+        ),
+        requiredChecks: z.array(z.string().min(1)).default([]).describe(
+          "Check names (e.g. the canary) the base branch's rulesets must require before anything is armed. Auto-merge merges as soon as REQUIRED checks pass, so a check that is not required would be skipped.",
+        ),
+        mergeMethod: z.enum(["squash", "merge", "rebase"]).default("squash")
+          .describe("Merge method for armed PRs; must be allowed by the repo."),
       }),
       execute: async (
         args: {
@@ -3817,6 +4176,9 @@ export const model = {
           dryRun: boolean;
           allowMajor: boolean;
           allowRemotePlugins: boolean;
+          autoMerge: AutoMergeScope;
+          requiredChecks: string[];
+          mergeMethod: "squash" | "merge" | "rebase";
         },
         context: Context,
       ) => {
@@ -3832,6 +4194,11 @@ export const model = {
         }
         if (args.toVersion && args.component === "all") {
           throw new Error("toVersion needs a single component, not `all`");
+        }
+        if (args.autoMerge !== "off" && args.requiredChecks.length === 0) {
+          throw new Error(
+            "autoMerge needs requiredChecks: name the check (the canary) that must pass before GitHub merges",
+          );
         }
         const gh = new GitHub(
           g.githubApiUrl,
@@ -3853,6 +4220,26 @@ export const model = {
         const remotePlugins = desired.settings.plugins.filter((p) =>
           p.mode === "remote"
         );
+        const gate: AutoMergeGate = {
+          scope: args.autoMerge,
+          method: args.mergeMethod,
+          blocked: null,
+        };
+        if (args.autoMerge !== "off") {
+          const have = await gh.requiredChecks(repo, g.ref);
+          const missing = missingChecks(args.requiredChecks, have);
+          if (missing.length) {
+            gate.blocked = `${g.ref} does not require ${
+              missing.join(", ")
+            } (rulesets require: ${
+              have.join(", ") || "none"
+            }); armed, it would merge without them`;
+          }
+          context.logger.info("auto-merge {scope}: {state}", {
+            scope: args.autoMerge,
+            state: gate.blocked ?? "gate ok",
+          });
+        }
         const selected = args.component === "all"
           ? components.filter((c) => c.status === "behind")
           : components.filter((c) => c.id === args.component);
@@ -3873,6 +4260,7 @@ export const model = {
             reason: null,
             branch: null,
             prUrl: null,
+            autoMerge: null,
             files: [],
             notes: [],
           };
@@ -3888,6 +4276,7 @@ export const model = {
                 pulls,
                 base,
                 context.signal,
+                gate,
               ),
             );
           } catch (err) {
@@ -3907,16 +4296,24 @@ export const model = {
           results,
           opened: results.filter((r) => r.status === "opened").length,
           failed: results.filter((r) => r.status === "failed").length,
+          armed:
+            results.filter((r) =>
+              r.autoMerge === "armed" || r.autoMerge === "merged"
+            ).length,
           timestamp: new Date().toISOString(),
         };
         for (const r of results) {
-          context.logger.info("{component}: {status} {from} -> {to} {detail}", {
-            component: r.component,
-            status: r.status,
-            from: r.from ?? "?",
-            to: r.to ?? "?",
-            detail: r.prUrl ?? r.reason ?? "",
-          });
+          context.logger.info(
+            "{component}: {status} {from} -> {to} {detail} {autoMerge}",
+            {
+              autoMerge: r.autoMerge ? `auto-merge=${r.autoMerge}` : "",
+              component: r.component,
+              status: r.status,
+              from: r.from ?? "?",
+              to: r.to ?? "?",
+              detail: r.prUrl ?? r.reason ?? "",
+            },
+          );
         }
         // Record what happened -- including PRs already opened -- before
         // failing, so a partial run is never lost.
@@ -3928,6 +4325,22 @@ export const model = {
                 `${r.component} (${r.reason})`
               ).join("; ")
             }; ${result.opened} PR(s) opened, recorded in the bump resource`,
+          );
+        }
+        // An open PR that was meant to merge on its own but cannot is a
+        // pipeline that has silently stopped: fail so the run is seen.
+        // `blocked` too: auto-merge was asked for and the gate is missing, which is
+        // a misconfiguration, not a PR quietly waiting for a person.
+        const armFailed = results.filter((r) =>
+          r.autoMerge === "failed" || r.autoMerge === "blocked"
+        );
+        if (armFailed.length > 0) {
+          throw new Error(
+            `auto-merge could not be armed on ${
+              armFailed.map((r) =>
+                `${r.component} ${r.prUrl ?? ""} (${r.notes.at(-1) ?? "?"})`
+              ).join("; ")
+            }; the PR(s) are open and need a person or a retry`,
           );
         }
         return result;

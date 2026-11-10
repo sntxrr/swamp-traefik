@@ -7,6 +7,8 @@ import {
 import {
   allowCatalogTestData,
   armAutoMerge,
+  ARMED_LABEL,
+  type ArmTarget,
   autoMergeAllows,
   type AutoMergeGate,
   autoMergeKind,
@@ -1685,70 +1687,126 @@ const gate = (o: Partial<AutoMergeGate> = {}): AutoMergeGate => ({
   ...o,
 });
 
-Deno.test("auto-merge: armAutoMerge decides before it calls GitHub", async () => {
-  const calls: [string, string][] = [];
-  const gh = {
-    enableAutoMerge: (id: string, m: string) => {
-      calls.push([id, m]);
-      return Promise.resolve();
+function fakeGh(opts: { armError?: string; clean?: boolean } = {}) {
+  const calls: string[] = [];
+  return {
+    calls,
+    gh: {
+      enableAutoMerge: (id: string, m: string) => {
+        calls.push(`arm ${id} ${m}`);
+        return opts.armError
+          ? Promise.reject(new Error(opts.armError))
+          : Promise.resolve();
+      },
+      mergeIfClean: (repo: string, n: number, m: string) => {
+        calls.push(`merge ${repo}#${n} ${m}`);
+        return Promise.resolve(opts.clean ?? false);
+      },
+      addLabel: (repo: string, n: number, l: string) => {
+        calls.push(`label ${repo}#${n} ${l}`);
+        return Promise.resolve();
+      },
     },
   };
-  const pr = { nodeId: "PR_1", autoMergeArmed: false };
+}
+
+const target = (o: Partial<ArmTarget> = {}): ArmTarget => ({
+  number: 7,
+  nodeId: "PR_7",
+  autoMergeArmed: false,
+  armable: true,
+  labels: [],
+  ...o,
+});
+
+Deno.test("auto-merge: armAutoMerge decides before it calls GitHub", async () => {
+  const { gh, calls } = fakeGh();
+  const arm = (
+    g: AutoMergeGate,
+    kind: "major" | "minor" | "patch",
+    pr: ArmTarget | null,
+    dry = false,
+  ) => armAutoMerge(gh, "me/deploy", g, kind, pr, dry);
   assertEquals(
-    (await armAutoMerge(gh, gate({ scope: "off" }), "patch", pr, false)).state,
+    (await arm(gate({ scope: "off" }), "patch", target())).state,
     null,
   );
+  assertEquals((await arm(gate(), "major", target())).state, "out-of-scope");
   assertEquals(
-    (await armAutoMerge(gh, gate(), "major", pr, false)).state,
+    (await arm(gate({ scope: "patch" }), "minor", target())).state,
     "out-of-scope",
   );
   assertEquals(
-    (await armAutoMerge(gh, gate({ scope: "patch" }), "minor", pr, false))
-      .state,
-    "out-of-scope",
+    (await arm(gate(), "patch", target({ armable: false }))).state,
+    "not-armable",
   );
-  const blocked = await armAutoMerge(
-    gh,
+  const blocked = await arm(
     gate({ blocked: "main does not require canary" }),
     "patch",
-    pr,
-    false,
+    target(),
   );
   assertEquals(blocked.state, "blocked");
   assertStringIncludes(blocked.note ?? "", "canary");
   assertEquals(
-    (await armAutoMerge(
-      gh,
-      gate(),
-      "patch",
-      { ...pr, autoMergeArmed: true },
-      false,
-    )).state,
+    (await arm(gate(), "patch", target({ autoMergeArmed: true }))).state,
     "already-armed",
   );
-  assertEquals(
-    (await armAutoMerge(gh, gate(), "patch", null, true)).state,
-    "would-arm",
-  );
+  const held = await arm(gate(), "patch", target({ labels: [ARMED_LABEL] }));
+  assertEquals(held.state, "held", "a person disarmed it: never re-armed");
+  assertEquals((await arm(gate(), "patch", null, true)).state, "would-arm");
   assertEquals(calls.length, 0, "nothing above may reach GitHub");
   assertEquals(
-    (await armAutoMerge(gh, gate({ method: "rebase" }), "minor", pr, false))
-      .state,
+    (await arm(gate({ method: "rebase" }), "minor", target())).state,
     "armed",
   );
-  assertEquals(calls, [["PR_1", "rebase"]]);
-  const failing = {
-    enableAutoMerge: () =>
-      Promise.reject(new Error("auto-merge is not allowed")),
-  };
-  const f = await armAutoMerge(failing, gate(), "patch", pr, false);
-  assertEquals(f.state, "failed");
-  assertStringIncludes(f.note ?? "", "not allowed");
   assertEquals(
-    (await armAutoMerge(gh, gate(), "patch", {
-      nodeId: null,
-      autoMergeArmed: false,
-    }, false)).state,
+    calls,
+    ["arm PR_7 rebase", `label me/deploy#7 ${ARMED_LABEL}`],
+    "label only after arming",
+  );
+  assertEquals(
+    (await arm(gate(), "patch", target({ nodeId: null }))).state,
+    "failed",
+  );
+});
+
+Deno.test("auto-merge: an arm failure is never labelled; a clean PR is merged at its head", async () => {
+  const f = fakeGh({ armError: "auto-merge is not allowed" });
+  const r = await armAutoMerge(
+    f.gh,
+    "me/deploy",
+    gate(),
+    "patch",
+    target(),
+    false,
+  );
+  assertEquals(r.state, "failed");
+  assertStringIncludes(r.note ?? "", "not allowed");
+  assertFalse(
+    f.calls.some((c) => c.startsWith("label")),
+    "a failed arm must not read as held later",
+  );
+  const c = fakeGh({
+    armError: "Pull request Pull request is in clean status",
+    clean: true,
+  });
+  const m = await armAutoMerge(
+    c.gh,
+    "me/deploy",
+    gate(),
+    "patch",
+    target(),
+    false,
+  );
+  assertEquals(m.state, "merged");
+  assertEquals(c.calls, ["arm PR_7 squash", "merge me/deploy#7 squash"]);
+  const nc = fakeGh({
+    armError: "Pull request is in clean status",
+    clean: false,
+  });
+  assertEquals(
+    (await armAutoMerge(nc.gh, "me/deploy", gate(), "patch", target(), false))
+      .state,
     "failed",
   );
 });
@@ -1829,6 +1887,35 @@ Deno.test("auto-merge: relatedPrs carries the PR's own target and node id", () =
   assertEquals(r.pending.length, 1);
   assertEquals(r.pending[0].nodeId, "PR_10");
   assertEquals(r.pending[0].to.patch, 2);
+  assert(r.pending[0].armable, "a trusted bot's PR is armable");
+  // A person pushing a branch with this model's naming is deferred to, not armed.
+  const human = relatedPrs(
+    [{
+      number: 11,
+      url: "u",
+      title: "x",
+      head: "swamp-traefik/image-crowdsecurity-crowdsec-v1.8.2",
+      author: "someone",
+      authorType: "User",
+    }],
+    { kind: "image", name: "crowdsecurity/crowdsec" },
+    parseVersion("v1.8.2"),
+  );
+  assertEquals(human.pending.length, 1);
+  assertFalse(human.pending[0].armable);
+  const app = relatedPrs(
+    [{
+      number: 12,
+      url: "u",
+      title: "x",
+      head: "swamp-traefik/image-crowdsecurity-crowdsec-v1.8.2",
+      author: "some-app[bot]",
+      authorType: "Bot",
+    }],
+    { kind: "image", name: "crowdsecurity/crowdsec" },
+    parseVersion("v1.8.2"),
+  );
+  assert(app.pending[0].armable);
 });
 
 Deno.test("auto-merge: a 0.x minor counts as a major", () => {
@@ -1837,4 +1924,9 @@ Deno.test("auto-merge: a 0.x minor counts as a major", () => {
   assertEquals(autoMergeKind(v("v0.8.9"), v("v0.8.10")), "patch");
   assertEquals(autoMergeKind(v("v1.7.1"), v("v1.8.1")), "minor");
   assertEquals(autoMergeKind(v("v3.7.17"), v("v3.7.18")), "patch");
+  assertEquals(
+    autoMergeKind(v("v3.7.9"), v("v3.8.0-rc.1")),
+    "major",
+    "a prerelease is never unattended",
+  );
 });

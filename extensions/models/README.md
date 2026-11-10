@@ -209,25 +209,44 @@ Also:
 `bump` never merges by itself. With `autoMerge: patch` or `autoMerge: minor`
 (`minor` includes patch), it arms GitHub auto-merge on the bump PRs it opens,
 and on a Dependabot or Renovate PR that `bump` already defers to. GitHub then
-merges each PR once every **required** check has passed, and never before.
+merges the PR once the branch's rules are met, meaning its required checks and
+any required reviews.
 
-- **A major is never armed.** Neither is a 0.x minor, which semver allows to
-  break. Those PRs still open, and a person merges them.
+What is never armed, so a person merges it:
+
+- **A major, a 0.x minor or a prerelease.** Semver allows a 0.x minor to break.
+- **A PR a person opened**, even on a branch named like this model's. Only a
+  `swamp-traefik/` branch opened by a bot account (the App this model's token
+  belongs to) counts as the model's own.
+- **A PR a person disarmed.** `bump` labels every PR it arms
+  `swamp-auto-merge`. A PR that carries the label but is no longer armed is
+  reported as `held` and left alone.
+
+The gate:
+
 - **`requiredChecks` is mandatory.** Name the check that proves the candidate,
   for example a canary that boots it. Auto-merge waits only for checks that
-  the branch's rulesets *require*, so a check that is not required would be
-  skipped. Before arming anything, `bump` reads the rulesets for `ref`. If any
-  named check is missing, every result is `autoMerge: blocked` and nothing is
-  armed. Classic branch protection is not read (that needs Administration
-  access), so a requirement that lives only there counts as missing.
-- A PR that opened but could not be armed (for example, auto-merge is
-  disabled on the repo) is `autoMerge: failed`, and the method fails, so a
-  pipeline that has stopped merging is noticed.
+  the branch's rulesets *require*. Before arming anything, `bump` reads the
+  rulesets for `ref`. If a named check is missing, every result is
+  `autoMerge: blocked` and the method fails. Classic branch protection is not
+  read (that needs Administration access), so a requirement that lives only
+  there counts as missing. A check is matched by name only.
+- If GitHub refuses to arm a PR because its requirements are already met
+  ("clean status"), `bump` merges it directly, pinned to the head commit
+  GitHub judged clean (`autoMerge: merged`).
+- A PR that opened but could not be armed is `autoMerge: failed`, and the
+  method fails, so a pipeline that has stopped merging is noticed.
 - The token needs `contents: write` and `pull_requests: write`, and the repo
   must allow auto-merge.
-- A rejected candidate stays rejected. Closing its PR leaves the branch behind,
-  and `bump` refuses to recreate a branch, so the same version is not
-  retried. The next upstream release gets a new branch.
+
+Two limits:
+
+- **Arming is never undone.** A bot PR that gets superseded, or a run after
+  `autoMerge` was narrowed, leaves an earlier PR armed. Close or disarm it by
+  hand.
+- **A rejected candidate stays rejected.** Closing its PR leaves the branch
+  behind, and `bump` refuses to recreate a branch. The same version is not
+  retried; the next upstream release gets a new branch.
 
 ## Using it from a workflow
 

@@ -6,6 +6,10 @@ import {
 } from "jsr:@std/assert@1.0.19";
 import {
   allowCatalogTestData,
+  armAutoMerge,
+  autoMergeAllows,
+  type AutoMergeGate,
+  autoMergeKind,
   buildRuntime,
   bumpOne,
   chooseTarget,
@@ -21,10 +25,12 @@ import {
   gitBlobSha,
   GitHub,
   githubRepoOfModule,
+  graphqlPath,
   hasConfigFlags,
   liveScript,
   locateStaticFile,
   logLineTime,
+  missingChecks,
   model,
   parseCompose,
   parseImageRef,
@@ -1594,6 +1600,7 @@ Deno.test("R3.2: bump refuses when the static configuration source is unknown", 
     reason: null,
     branch: null,
     prUrl: null,
+    autoMerge: null,
     files: [],
     notes: [],
   };
@@ -1640,4 +1647,194 @@ Deno.test("R3.12/R3.14: PR body flags a 0.x minor and never names the host", () 
     [],
   );
   assertFalse(patch.includes("Pre-1.0 minor"));
+});
+
+// --- auto-merge -------------------------------------------------------------
+
+Deno.test("auto-merge: scope never admits a major", () => {
+  const rows: [string, string, boolean][] = [
+    ["off", "patch", false],
+    ["patch", "patch", true],
+    ["patch", "minor", false],
+    ["minor", "patch", true],
+    ["minor", "minor", true],
+    ["minor", "major", false],
+    ["patch", "major", false],
+  ];
+  for (const [scope, kind, want] of rows) {
+    assertEquals(
+      // deno-lint-ignore no-explicit-any
+      autoMergeAllows(scope as any, kind as any),
+      want,
+      `${scope}/${kind}`,
+    );
+  }
+});
+
+Deno.test("auto-merge: missingChecks names exactly the unrequired ones", () => {
+  assertEquals(missingChecks(["canary", "validate"], ["validate"]), [
+    "canary",
+  ]);
+  assertEquals(missingChecks(["canary"], ["canary", "validate"]), []);
+});
+
+const gate = (o: Partial<AutoMergeGate> = {}): AutoMergeGate => ({
+  scope: "minor",
+  method: "squash",
+  blocked: null,
+  ...o,
+});
+
+Deno.test("auto-merge: armAutoMerge decides before it calls GitHub", async () => {
+  const calls: [string, string][] = [];
+  const gh = {
+    enableAutoMerge: (id: string, m: string) => {
+      calls.push([id, m]);
+      return Promise.resolve();
+    },
+  };
+  const pr = { nodeId: "PR_1", autoMergeArmed: false };
+  assertEquals(
+    (await armAutoMerge(gh, gate({ scope: "off" }), "patch", pr, false)).state,
+    null,
+  );
+  assertEquals(
+    (await armAutoMerge(gh, gate(), "major", pr, false)).state,
+    "out-of-scope",
+  );
+  assertEquals(
+    (await armAutoMerge(gh, gate({ scope: "patch" }), "minor", pr, false))
+      .state,
+    "out-of-scope",
+  );
+  const blocked = await armAutoMerge(
+    gh,
+    gate({ blocked: "main does not require canary" }),
+    "patch",
+    pr,
+    false,
+  );
+  assertEquals(blocked.state, "blocked");
+  assertStringIncludes(blocked.note ?? "", "canary");
+  assertEquals(
+    (await armAutoMerge(
+      gh,
+      gate(),
+      "patch",
+      { ...pr, autoMergeArmed: true },
+      false,
+    )).state,
+    "already-armed",
+  );
+  assertEquals(
+    (await armAutoMerge(gh, gate(), "patch", null, true)).state,
+    "would-arm",
+  );
+  assertEquals(calls.length, 0, "nothing above may reach GitHub");
+  assertEquals(
+    (await armAutoMerge(gh, gate({ method: "rebase" }), "minor", pr, false))
+      .state,
+    "armed",
+  );
+  assertEquals(calls, [["PR_1", "rebase"]]);
+  const failing = {
+    enableAutoMerge: () =>
+      Promise.reject(new Error("auto-merge is not allowed")),
+  };
+  const f = await armAutoMerge(failing, gate(), "patch", pr, false);
+  assertEquals(f.state, "failed");
+  assertStringIncludes(f.note ?? "", "not allowed");
+  assertEquals(
+    (await armAutoMerge(gh, gate(), "patch", {
+      nodeId: null,
+      autoMergeArmed: false,
+    }, false)).state,
+    "failed",
+  );
+});
+
+Deno.test("auto-merge: requiredChecks reads rulesets; GraphQL errors at HTTP 200 throw", async () => {
+  const seen: { url: string; body: string | null }[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input)).href;
+    seen.push({ url, body: init?.body ? String(init.body) : null });
+    if (url.includes("/rules/branches/")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify([
+            { type: "pull_request", parameters: {} },
+            {
+              type: "required_status_checks",
+              parameters: {
+                required_status_checks: [{ context: "validate" }, {
+                  context: "canary",
+                }],
+              },
+            },
+          ]),
+          { status: 200 },
+        ),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          data: null,
+          errors: [{
+            message: "Auto merge is not allowed for this repository",
+          }],
+        }),
+        { status: 200 },
+      ),
+    );
+  }) as typeof fetch;
+  try {
+    const gh = new GitHub("https://ghe.example/api/v3", "T", 1000);
+    assertEquals(await gh.requiredChecks("me/deploy", "main"), [
+      "canary",
+      "validate",
+    ]);
+    let err: unknown = null;
+    try {
+      await gh.enableAutoMerge("PR_1", "squash");
+    } catch (e) {
+      err = e;
+    }
+    assert(err instanceof Error);
+    assertStringIncludes(err.message, "not allowed");
+    assertEquals(seen[1].url, "https://ghe.example/api/graphql");
+    assertStringIncludes(seen[1].body ?? "", '"m":"SQUASH"');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assertEquals(graphqlPath("https://api.github.com"), "/graphql");
+});
+
+Deno.test("auto-merge: relatedPrs carries the PR's own target and node id", () => {
+  const r = relatedPrs(
+    [{
+      number: 10,
+      url: "u",
+      title: "chore(deps): bump crowdsecurity/crowdsec from v1.8.1 to v1.8.2",
+      head: "dependabot/docker_compose/crowdsecurity/crowdsec-v1.8.2",
+      author: "app/dependabot",
+      nodeId: "PR_10",
+      autoMergeArmed: false,
+    }],
+    { kind: "image", name: "crowdsecurity/crowdsec" },
+    parseVersion("v1.8.2"),
+    parseVersion("v1.8.1"),
+  );
+  assertEquals(r.pending.length, 1);
+  assertEquals(r.pending[0].nodeId, "PR_10");
+  assertEquals(r.pending[0].to.patch, 2);
+});
+
+Deno.test("auto-merge: a 0.x minor counts as a major", () => {
+  const v = (x: string) => parseVersion(x)!;
+  assertEquals(autoMergeKind(v("v0.8.9"), v("v0.9.0")), "major");
+  assertEquals(autoMergeKind(v("v0.8.9"), v("v0.8.10")), "patch");
+  assertEquals(autoMergeKind(v("v1.7.1"), v("v1.8.1")), "minor");
+  assertEquals(autoMergeKind(v("v3.7.17"), v("v3.7.18")), "patch");
 });

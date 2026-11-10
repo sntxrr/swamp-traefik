@@ -204,6 +204,31 @@ Also:
   variant suffix;
 - several compose files, for example Traefik and CrowdSec in separate ones.
 
+## Auto-merge
+
+`bump` never merges by itself. With `autoMerge: patch` or `autoMerge: minor`
+(`minor` includes patch), it arms GitHub auto-merge on the bump PRs it opens,
+and on a Dependabot or Renovate PR that `bump` already defers to. GitHub then
+merges each PR once every **required** check has passed, and never before.
+
+- **A major is never armed.** Neither is a 0.x minor, which semver allows to
+  break. Those PRs still open, and a person merges them.
+- **`requiredChecks` is mandatory.** Name the check that proves the candidate,
+  for example a canary that boots it. Auto-merge waits only for checks that
+  the branch's rulesets *require*, so a check that is not required would be
+  skipped. Before arming anything, `bump` reads the rulesets for `ref`. If any
+  named check is missing, every result is `autoMerge: blocked` and nothing is
+  armed. Classic branch protection is not read (that needs Administration
+  access), so a requirement that lives only there counts as missing.
+- A PR that opened but could not be armed (for example, auto-merge is
+  disabled on the repo) is `autoMerge: failed`, and the method fails, so a
+  pipeline that has stopped merging is noticed.
+- The token needs `contents: write` and `pull_requests: write`, and the repo
+  must allow auto-merge.
+- A rejected candidate stays rejected. Closing its PR leaves the branch behind,
+  and `bump` refuses to recreate a branch, so the same version is not
+  retried. The next upstream release gets a new branch.
+
 ## Using it from a workflow
 
 `check` writes a `check` resource with `behind`, `critical`, `findingCount` and
